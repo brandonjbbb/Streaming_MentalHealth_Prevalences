@@ -7,13 +7,11 @@ producer = KafkaProducer(
     value_serializer=lambda v: json.dumps(v).encode("utf-8")
 )
 
-topic = "test_topic"
-
 for i in range(5):
-    message = {"msg": f"hello world {i}"}
-    producer.send(topic, value=message)
+    message = {"number": i, "status": "ok"}
+    producer.send("test_topic", message)
     print(f"Sent: {message}")
     time.sleep(1)
 
 producer.flush()
-
+producer.close()
