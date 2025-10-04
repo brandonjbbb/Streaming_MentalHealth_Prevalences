@@ -69,3 +69,7 @@ topic-list:
 topic-describe:
 	@set -a; . $(ENV); set +a; \
 	kafka-topics --describe --topic $$TOPIC --bootstrap-server $$KAFKA_BOOTSTRAP || true
+
+summary:
+	@set -a; . $(ENV); set +a; \
+	python3 Utils/spikes_summary.py
