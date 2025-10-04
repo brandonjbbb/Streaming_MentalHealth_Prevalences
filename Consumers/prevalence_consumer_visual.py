@@ -1,6 +1,7 @@
-# I render a dual-panel live view and also snapshot the chart to PNG on a timer and on exit.
+# I render a dual-panel live view and snapshot to PNG on a timer and on exit.
+# I also archive timestamped PNGs into Images/archive for reporting.
 
-import os, os.path, json, sys, signal, csv, time
+import os, os.path, json, sys, signal, csv, time, datetime as dt
 from collections import deque
 from kafka import KafkaConsumer
 import matplotlib.pyplot as plt
@@ -15,9 +16,10 @@ SIGMAS        = float(os.getenv("SPIKE_SIGMAS", "2.0"))
 MIN_DELTA     = float(os.getenv("SPIKE_MIN_DELTA", "0.03"))
 STATE_FILTER  = [s.strip() for s in os.getenv("STATE_FILTER", "*").split(",")]
 COND_FILTER   = [s.strip() for s in os.getenv("CONDITION_FILTER", "*").split(",")]
-SINK_PATH     = os.getenv("SPIKE_SINK_PATH", "").strip()
+SINK_PATH     = os.getenv("SPIKE_SINK_PATH", "Data/spikes.csv").strip()
 SNAP_PATH     = os.getenv("SNAPSHOT_PATH", "Images/visual_latest.png").strip()
 SNAP_EVERY    = float(os.getenv("SNAPSHOT_EVERY_SEC", "10"))
+ARCHIVE_DIR   = os.getenv("SNAPSHOT_ARCHIVE_DIR", "Images/archive").strip()
 
 def allowed(state, cond):
     s_ok = STATE_FILTER == ["*"] or state in STATE_FILTER
@@ -100,13 +102,24 @@ def is_spike(value, mean, std, have_window):
     return z >= SIGMAS and abs(value - mean) >= MIN_DELTA
 
 last_snap = 0.0
+def snapshot_files():
+    if not SNAP_PATH: return []
+    os.makedirs(os.path.dirname(SNAP_PATH), exist_ok=True)
+    files = []
+    fig.savefig(SNAP_PATH, dpi=150, bbox_inches="tight"); files.append(SNAP_PATH)
+    if ARCHIVE_DIR:
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_path = os.path.join(ARCHIVE_DIR, f"visual_{ts}.png")
+        fig.savefig(archive_path, dpi=150, bbox_inches="tight"); files.append(archive_path)
+    return files
+
 def maybe_snapshot():
     global last_snap
-    if not SNAP_PATH or SNAP_EVERY <= 0: return
+    if SNAP_EVERY <= 0: return
     now = time.time()
     if now - last_snap >= SNAP_EVERY:
-        os.makedirs(os.path.dirname(SNAP_PATH), exist_ok=True)
-        fig.savefig(SNAP_PATH, dpi=150, bbox_inches="tight")
+        snapshot_files()
         last_snap = now
 
 def update(_frame):
@@ -165,12 +178,8 @@ def on_key(event):
         _close()
 
 def _close(*_):
-    try:
-        if SNAP_PATH:
-            os.makedirs(os.path.dirname(SNAP_PATH), exist_ok=True)
-            fig.savefig(SNAP_PATH, dpi=150, bbox_inches="tight")
-    except Exception:
-        pass
+    try: snapshot_files()
+    except Exception: pass
     plt.close("all")
     try: consumer.close()
     except Exception: pass
