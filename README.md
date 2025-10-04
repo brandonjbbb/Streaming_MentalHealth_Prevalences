@@ -26,3 +26,5 @@ cp .env.example .env
 This animated line updates as each message arrives, showing the latest prevalence and a rolling mean (window=5) to smooth short-term noise.
 
 ![Rolling average](images/rolling_avg.png)
+## Live Preview (CSV Replay)
+![Rolling prevalence demo](images/demo.gif)
