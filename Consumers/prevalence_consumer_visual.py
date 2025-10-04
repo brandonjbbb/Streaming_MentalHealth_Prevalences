@@ -1,26 +1,20 @@
-# I animate a live line chart of prevalence with a rolling average overlay,
-# consuming JSON events from Kafka in real time.
+# I render a live line chart of prevalence and a rolling mean, and flag spikes in real time.
 
-import os, json, datetime
+import os, json, sys, signal
 from collections import deque
-
-import matplotlib
-# Prefer the macOS interactive backend; fall back to TkAgg if needed.
-try:
-    matplotlib.use("MacOSX")
-except Exception:
-    matplotlib.use("TkAgg")
-
+from kafka import KafkaConsumer
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from kafka import KafkaConsumer
+import numpy as np
 
-# Externalized config via .env for easy reuse.
+# I keep these configurable so others can tune sensitivity without code edits.
 BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
-TOPIC = os.getenv("TOPIC", "mental-health-prevalence")
-WINDOW = int(os.getenv("ROLLING_WINDOW", "5"))
-SPIKE_THRESH = float(os.getenv("SPIKE_THRESH", "0.03"))
+TOPIC      = os.getenv("TOPIC", "mental-health-prevalence")
+WINDOW     = int(os.getenv("ROLLING_WINDOW", "5"))          # rolling mean window
+SIGMAS     = float(os.getenv("SPIKE_SIGMAS", "2.0"))        # spike threshold (z-score)
+MIN_DELTA  = float(os.getenv("SPIKE_MIN_DELTA", "0.03"))    # minimum absolute move to count as spike
 
+# I create a consumer that reads earliest so the demo is deterministic.
 consumer = KafkaConsumer(
     TOPIC,
     bootstrap_servers=BOOTSTRAP,
@@ -30,71 +24,96 @@ consumer = KafkaConsumer(
     value_deserializer=lambda b: json.loads(b.decode("utf-8")),
 )
 
-vals = deque(maxlen=WINDOW)
-xs, ys, avgs = [], [], []
-t0 = None
-last_v = None
+# I maintain series buffers for plotting and spike markers.
+xs, ys, means = [], [], []
+roll = deque(maxlen=WINDOW)
+spike_x, spike_y = [], []
 
-def ts_to_seconds(s: str) -> float:
-    """Map ISO time to seconds since first event for a clean x-axis."""
-    global t0
-    dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
-    if t0 is None:
-        t0 = dt
-    return (dt - t0).total_seconds()
+# I set up the figure once; FuncAnimation only updates data.
+fig, ax = plt.subplots(figsize=(8, 4.8))
+(line,) = ax.plot([], [], lw=2, label="prevalence")
+(mean_line,) = ax.plot([], [], lw=2, linestyle="--", label=f"rolling mean (w={WINDOW})")
+spike_scatter = ax.scatter([], [], s=60, marker="o", edgecolors="none", label="spike")
+alert_txt = ax.text(
+    0.01, 0.98, "", transform=ax.transAxes, va="top", ha="left", fontsize=10
+)
 
-fig, ax = plt.subplots()
-line_raw, = ax.plot([], [], label="prevalence")
-line_avg, = ax.plot([], [], linestyle="--", label=f"rolling avg ({WINDOW})")
-ax.set_xlabel("seconds since start")
-ax.set_ylabel("prevalence (fraction)")
-ax.set_title("Live Mental-Health Prevalence (rolling average)")
-ax.legend(loc="upper left")
-ax.grid(True, alpha=0.3)
-text_annot = ax.text(0.02, 0.95, "", transform=ax.transAxes, va="top", ha="left")
+ax.set_title("Live Mental-Health Prevalence (streaming)")
+ax.set_xlabel("event #")
+ax.set_ylabel("prevalence")
+ax.grid(True, alpha=0.25)
+ax.legend(loc="lower right")
 
-def maybe_spike_alert(v):
-    global last_v
-    if last_v is None:
-        last_v = v
-        return None
-    if abs(v - last_v) >= SPIKE_THRESH:
-        msg = f"spike: Δ={v-last_v:+.3f}"
-        print(msg)
-        last_v = v
-        return msg
-    last_v = v
-    return None
+def compute_stats(buf):
+    # I compute mean/std for the current rolling buffer.
+    arr = np.array(buf, dtype=float)
+    mean = float(arr.mean())
+    std = float(arr.std(ddof=0))
+    return mean, std
+
+def maybe_spike(value, mean, std):
+    # I require both a z-score threshold and a minimum absolute movement to reduce false positives.
+    if len(roll) < WINDOW:
+        return False
+    if std == 0:
+        return abs(value - mean) >= MIN_DELTA
+    z = abs((value - mean) / std)
+    return z >= SIGMAS and abs(value - mean) >= MIN_DELTA
 
 def update(_frame):
+    # I poll Kafka briefly so the UI stays responsive.
+    alerted = ""
     polled = consumer.poll(timeout_ms=100)
-    new_points = 0
-    for _, records in polled.items():
-        for r in records:
-            v = float(r.value["prevalence"])
-            x = ts_to_seconds(r.value["timestamp"])
-            xs.append(x); ys.append(v)
-            vals.append(v)
-            avgs.append(sum(vals) / len(vals))
-            new_points += 1
-            alert = maybe_spike_alert(v)
-            if alert:
-                text_annot.set_text(alert)
+    got_any = False
 
-    if new_points == 0:
-        if text_annot.get_text():
-            text_annot.set_text("")
-        return line_raw, line_avg, text_annot
+    for _tp, records in polled.items():
+        for rec in records:
+            got_any = True
+            v = float(rec.value["prevalence"])
+            xs.append(len(xs))           # event index as x-axis; simple and robust
+            ys.append(v)
 
-    ax.relim(); ax.autoscale_view()
-    line_raw.set_data(xs, ys)
-    line_avg.set_data(xs, avgs)
-    return line_raw, line_avg, text_annot
+            roll.append(v)
+            m, s = compute_stats(roll)
+            means.append(m)
 
-ani = FuncAnimation(fig, update, interval=250, blit=True)
+            if maybe_spike(v, m, s):
+                spike_x.append(xs[-1])
+                spike_y.append(v)
+                direction = "↑" if v > m else "↓"
+                alerted = f"SPIKE {direction}  v={v:.3f}  μ={m:.3f}  σ={s:.3f}"
 
-print("Listening + animating… (close the window or Ctrl+C to quit)")
-try:
-    plt.show()
-finally:
-    consumer.close()
+    # I update the plot only if new records arrived; still return artists for blitting.
+    if got_any:
+        line.set_data(xs, ys)
+        mean_line.set_data(xs, means)
+
+        if spike_x:
+            # set_offsets wants an (N,2) array-like
+            offs = np.column_stack([spike_x, spike_y])
+            spike_scatter.set_offsets(offs)
+
+        # I keep axes comfortable around incoming data.
+        ax.relim()
+        ax.autoscale_view()
+
+        # I keep a subtle alert banner in the corner when a spike happens.
+        alert_txt.set_text(alerted)
+
+    return line, mean_line, spike_scatter, alert_txt
+
+def _close(*_args):
+    plt.close("all")
+    try:
+        consumer.close()
+    except Exception:
+        pass
+    sys.exit(0)
+
+# I handle Ctrl+C cleanly.
+signal.signal(signal.SIGINT, _close)
+signal.signal(signal.SIGTERM, _close)
+
+ani = FuncAnimation(fig, update, interval=300, blit=True)
+plt.tight_layout()
+plt.show()
