@@ -17,7 +17,8 @@ producer = KafkaProducer(
 )
 
 # I iterate the sample CSV and emit one event per row to simulate a live feed.
-with open("Data/sample_prevalence.csv") as f:
+DATA_CSV = os.getenv("DATA_CSV", "Data/sample_prevalence.csv")
+with open(DATA_CSV) as f:
     for row in csv.DictReader(f):
         row["prevalence"] = float(row["prevalence"])  # ensure numeric for downstream math
         producer.send(TOPIC, row)                      # async send to Kafka
