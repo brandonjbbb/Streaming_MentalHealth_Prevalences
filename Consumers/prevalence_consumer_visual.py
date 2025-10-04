@@ -1,8 +1,10 @@
-# I render a live line chart per (state, condition), each with a rolling mean.
-# I support filtering via env vars and let viewers toggle series by clicking the legend.
+# I render a dual-panel live view:
+#   • Top: raw prevalence per (state, condition) + rolling mean
+#   • Bottom: corresponding z-score stream with ±threshold lines
+# I keep filter knobs in .env and let viewers toggle series by clicking the legend.
 
 import os, json, sys, signal
-from collections import deque, defaultdict
+from collections import deque
 from kafka import KafkaConsumer
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -31,38 +33,48 @@ consumer = KafkaConsumer(
     value_deserializer=lambda b: json.loads(b.decode("utf-8")),
 )
 
-# --- Plot setup ---
-fig, ax = plt.subplots(figsize=(9, 5))
-ax.set_title("Live Mental-Health Prevalence (click legend to toggle series, press Q to quit)")
-ax.set_xlabel("event #")
-ax.set_ylabel("prevalence")
-ax.grid(True, alpha=0.25)
+# --- Figure layout (dual panel) ---
+fig, (ax_top, ax_bot) = plt.subplots(
+    2, 1, figsize=(10, 6), sharex=True,
+    gridspec_kw={"height_ratios": [3, 1], "hspace": 0.12}
+)
+ax_top.set_title("Live Mental-Health Prevalence (click legend to toggle series, press Q to quit)")
+ax_top.set_ylabel("prevalence")
+ax_top.grid(True, alpha=0.25)
 
-# I manage one structure per series key like "CA–anxiety"
-series = {}
-legend_map = {}     # map legend handle -> key for click toggling
-legend_dirty = True # rebuild legend when new series appear
+ax_bot.set_xlabel("event # (per series)")
+ax_bot.set_ylabel("z-score")
+ax_bot.grid(True, alpha=0.25)
+ax_bot.axhline(SIGMAS, linestyle=":", linewidth=1)
+ax_bot.axhline(-SIGMAS, linestyle=":", linewidth=1)
 
-def make_key(state, cond):
-    return f"{state}–{cond}"
+# I keep all artists + buffers per series key like "CA–anxiety".
+series = {}       # key -> dict of data + artists
+legend_map = {}   # legend handle -> key
+
+def key_of(state, cond): return f"{state}–{cond}"
 
 def create_series(key):
-    # one raw line, one rolling mean line, and a spike scatter, all initially invisible until they get data
-    line, = ax.plot([], [], lw=2, label=key, visible=True)
-    mean_line, = ax.plot([], [], lw=1.5, linestyle="--", alpha=0.9, visible=True)
-    scatter = ax.scatter([], [], s=60, marker="o", edgecolors="none", visible=True)
+    # top panel: raw + rolling mean + spike markers
+    line_raw,   = ax_top.plot([], [], lw=2, label=key, visible=True)
+    line_mean,  = ax_top.plot([], [], lw=1.5, linestyle="--", alpha=0.9, visible=True)
+    sc_spikes   = ax_top.scatter([], [], s=60, marker="o", edgecolors="none", visible=True)
+    # bottom panel: z-score line
+    line_z,     = ax_bot.plot([], [], lw=1.5, alpha=0.95, visible=True)
+
     series[key] = {
-        "xs": [], "ys": [], "means": [],
+        # buffers
+        "xs": [], "ys": [], "means": [], "zs": [],
         "roll": deque(maxlen=WINDOW),
         "spike_x": [], "spike_y": [],
-        "line": line, "mean_line": mean_line, "scatter": scatter,
+        # artists
+        "raw": line_raw, "mean": line_mean, "spike": sc_spikes, "z": line_z,
     }
 
 def rebuild_legend():
     global legend_map
-    leg = ax.legend(loc="lower right", fancybox=True, framealpha=0.5)
+    leg = ax_top.legend(loc="lower right", fancybox=True, framealpha=0.5)
     legend_map = {}
-    # I map legend entries back to their real lines by label
     for lh in leg.legendHandles:
         label = lh.get_label()
         if label in series:
@@ -71,23 +83,20 @@ def rebuild_legend():
             legend_map[lh] = label
     fig.canvas.draw_idle()
 
-def compute_stats(buf):
+def stats(buf):
     arr = np.asarray(buf, dtype=float)
     return float(arr.mean()), float(arr.std(ddof=0))
 
-def maybe_spike(value, mean, std, have_window):
-    if not have_window:
-        return False
-    if std == 0:
-        return abs(value - mean) >= MIN_DELTA
+def is_spike(value, mean, std, have_window):
+    if not have_window: return False
+    if std == 0: return abs(value - mean) >= MIN_DELTA
     z = abs((value - mean) / std)
     return z >= SIGMAS and abs(value - mean) >= MIN_DELTA
 
 def update(_frame):
-    global legend_dirty
     polled = consumer.poll(timeout_ms=100)
-    got_any = False
     created = False
+    got_any = False
 
     for _tp, records in polled.items():
         for rec in records:
@@ -97,31 +106,37 @@ def update(_frame):
             if not allowed(state, cond):
                 continue
 
-            key = make_key(state, cond)
-            if key not in series:
-                create_series(key)
+            k = key_of(state, cond)
+            if k not in series:
+                create_series(k)
                 created = True
 
-            s = series[key]
+            s = series[k]
             val = float(v["prevalence"])
 
-            s["xs"].append(len(s["xs"]))  # per-series event index on x-axis
+            # x position is per-series event index to keep lines continuous within each key
+            s["xs"].append(len(s["xs"]))
             s["ys"].append(val)
             s["roll"].append(val)
 
-            mean, std = compute_stats(s["roll"])
+            mean, std = stats(s["roll"])
             s["means"].append(mean)
+            z = 0.0 if std == 0 else (val - mean) / std
+            s["zs"].append(z)
 
-            if maybe_spike(val, mean, std, len(s["roll"]) >= WINDOW):
+            if is_spike(val, mean, std, len(s["roll"]) >= WINDOW):
                 s["spike_x"].append(s["xs"][-1])
                 s["spike_y"].append(val)
 
-            # push updated data to artists
-            s["line"].set_data(s["xs"], s["ys"])
-            s["mean_line"].set_data(s["xs"], s["means"])
+            # push to artists
+            s["raw"].set_data(s["xs"], s["ys"])
+            s["mean"].set_data(s["xs"], s["means"])
+            s["z"].set_data(s["xs"], s["zs"])
             if s["spike_x"]:
                 offs = np.column_stack([s["spike_x"], s["spike_y"]])
-                s["scatter"].set_offsets(offs)
+            else:
+                offs = np.empty((0, 2))
+            s["spike"].set_offsets(offs)
 
             got_any = True
 
@@ -129,38 +144,35 @@ def update(_frame):
         rebuild_legend()
 
     if got_any:
-        ax.relim()
-        ax.autoscale_view()
+        ax_top.relim(); ax_top.autoscale_view()
+        ax_bot.relim(); ax_bot.autoscale_view(scaley=True)
 
-    # return artists for blitting
     artists = []
     for s in series.values():
-        artists.extend([s["line"], s["mean_line"], s["scatter"]])
+        artists.extend([s["raw"], s["mean"], s["spike"], s["z"]])
     return artists
 
 def on_pick(event):
-    # click legend line to toggle its series (raw+mean+spikes together)
+    # clicking a legend item toggles its entire series across both panels
     handle = event.artist
     key = legend_map.get(handle)
-    if not key:
-        return
+    if not key: return
     s = series[key]
-    vis = not s["line"].get_visible()
-    s["line"].set_visible(vis)
-    s["mean_line"].set_visible(vis)
-    s["scatter"].set_visible(vis)
+    vis = not s["raw"].get_visible()
+    s["raw"].set_visible(vis)
+    s["mean"].set_visible(vis)
+    s["spike"].set_visible(vis)
+    s["z"].set_visible(vis)
     fig.canvas.draw_idle()
 
 def on_key(event):
     if event.key and event.key.lower() == "q":
         _close()
 
-def _close(*_args):
+def _close(*_):
     plt.close("all")
-    try:
-        consumer.close()
-    except Exception:
-        pass
+    try: consumer.close()
+    except Exception: pass
     sys.exit(0)
 
 fig.canvas.mpl_connect("pick_event", on_pick)
