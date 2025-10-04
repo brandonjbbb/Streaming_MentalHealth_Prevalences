@@ -73,3 +73,12 @@ topic-describe:
 summary:
 	@set -a; . $(ENV); set +a; \
 	python3 Utils/spikes_summary.py
+
+gen:
+	@python3 Utils/generate_prevalence_csv.py --rows 300 --states CA,NY,TX,FL --conditions anxiety,dep,stress --out Data/sample_prevalence.csv
+
+open-latest:
+	@open Images/visual_latest.png 2>/dev/null || true
+
+open-archive:
+	@open Images/archive 2>/dev/null || true
