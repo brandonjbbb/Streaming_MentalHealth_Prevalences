@@ -1,198 +1,113 @@
-# I render a dual-panel live view and snapshot to PNG on a timer and on exit.
-# I also archive timestamped PNGs into Images/archive for reporting.
+# Consumers/prevalence_consumer_visual.py
+# Live visualization of mental-health prevalence streamed via Kafka.
+# Dynamically creates a line per (state, condition).
+# Rolling average and z-scores are shown; press Q to quit.
 
-import os, os.path, json, sys, signal, csv, time, datetime as dt
+import os, json, time, math
 from collections import deque
 from kafka import KafkaConsumer
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-import numpy as np
-from matplotlib import cm
 
-BOOTSTRAP     = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
-TOPIC         = os.getenv("TOPIC", "mental-health-prevalence")
-WINDOW        = int(os.getenv("ROLLING_WINDOW", "5"))
-SIGMAS        = float(os.getenv("SPIKE_SIGMAS", "2.0"))
-MIN_DELTA     = float(os.getenv("SPIKE_MIN_DELTA", "0.03"))
-STATE_FILTER  = [s.strip() for s in os.getenv("STATE_FILTER", "*").split(",")]
-COND_FILTER   = [s.strip() for s in os.getenv("CONDITION_FILTER", "*").split(",")]
-SINK_PATH     = os.getenv("SPIKE_SINK_PATH", "Data/spikes.csv").strip()
-SNAP_PATH     = os.getenv("SNAPSHOT_PATH", "Images/visual_latest.png").strip()
-SNAP_EVERY    = float(os.getenv("SNAPSHOT_EVERY_SEC", "10"))
-ARCHIVE_DIR   = os.getenv("SNAPSHOT_ARCHIVE_DIR", "Images/archive").strip()
+# === Config from .env ===
+BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+TOPIC     = os.getenv("TOPIC", "mental-health-prevalence")
+WINDOW    = int(os.getenv("ROLLING_WINDOW", "6"))
+GROUP_ID  = os.getenv("GROUP_ID", f"mh-visual-{int(time.time())}")
 
-def allowed(state, cond):
-    s_ok = STATE_FILTER == ["*"] or state in STATE_FILTER
-    c_ok = COND_FILTER == ["*"] or cond in COND_FILTER
-    return s_ok and c_ok
-
+# === Kafka Consumer ===
 consumer = KafkaConsumer(
     TOPIC,
     bootstrap_servers=BOOTSTRAP,
     auto_offset_reset="earliest",
-    enable_auto_commit=True,
-    group_id="mh-prevalence-visual",
+    enable_auto_commit=False,
+    group_id=GROUP_ID,
     value_deserializer=lambda b: json.loads(b.decode("utf-8")),
 )
 
-spike_fp = None
-spike_writer = None
-if SINK_PATH:
-    os.makedirs(os.path.dirname(SINK_PATH), exist_ok=True)
-    new_file = not os.path.exists(SINK_PATH) or os.path.getsize(SINK_PATH) == 0
-    spike_fp = open(SINK_PATH, "a", newline="")
-    spike_writer = csv.writer(spike_fp)
-    if new_file:
-        spike_writer.writerow(
-            ["event_index","timestamp","state","condition","prevalence",
-             "rolling_mean","rolling_std","zscore","window","threshold_sigmas","min_delta"]
-        )
+# === Matplotlib setup ===
+plt.rcParams["figure.autolayout"] = True
+fig, (ax, ax_z) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
 
-def color_for_key(key: str):
-    palette = cm.get_cmap("tab20").colors
-    return palette[(hash(key) % len(palette))]
+ax.set_title("NHIS 2019 Mental-Health Prevalence (live stream)")
+ax.set_ylabel("prevalence")
+ax.set_ylim(0, 1)
+ax.grid(True, alpha=0.3)
 
-fig, (ax_top, ax_bot) = plt.subplots(
-    2, 1, figsize=(10, 6), sharex=True,
-    gridspec_kw={"height_ratios": [3, 1], "hspace": 0.12}
-)
-ax_top.set_title("Live Mental-Health Prevalence (click legend to toggle; press Q to quit)")
-ax_top.set_ylabel("prevalence"); ax_top.grid(True, alpha=0.25)
-ax_bot.set_xlabel("event # (per series)")
-ax_bot.set_ylabel("z-score"); ax_bot.grid(True, alpha=0.25)
-ax_bot.axhline(SIGMAS, linestyle=":", linewidth=1)
-ax_bot.axhline(-SIGMAS, linestyle=":", linewidth=1)
+ax_z.set_ylabel("z-score")
+ax_z.axhline(2, ls="--", alpha=0.3)
+ax_z.axhline(-2, ls="--", alpha=0.3)
+ax_z.grid(True, alpha=0.3)
+ax_z.set_xlabel("event index")
 
-series, legend_map = {}, {}
+# === Data storage ===
+series = {}  # key -> {"x": [], "y": [], "line": Line2D, "buf": deque()}
 
-def key_of(state, cond): return f"{state}–{cond}"
+def zscore(buf):
+    if len(buf) < 2:
+        return 0.0
+    m = sum(buf) / len(buf)
+    var = sum((x - m) ** 2 for x in buf) / (len(buf) - 1)
+    return (buf[-1] - m) / max(math.sqrt(var), 1e-6)
 
-def create_series(key):
-    c = color_for_key(key)
-    (line_raw,)  = ax_top.plot([], [], lw=2, label=key, visible=True, color=c)
-    (line_mean,) = ax_top.plot([], [], lw=1.5, linestyle="--", alpha=0.95, visible=True, color=c)
-    sc_spikes    = ax_top.scatter([], [], s=60, marker="o", edgecolors="none", visible=True); sc_spikes.set_facecolor(c)
-    (line_z,)    = ax_bot.plot([], [], lw=1.5, alpha=0.95, visible=True, color=c)
-    series[key] = {
-        "xs": [], "ys": [], "means": [], "zs": [],
-        "roll": deque(maxlen=WINDOW),
-        "spike_x": [], "spike_y": [],
-        "raw": line_raw, "mean": line_mean, "spike": sc_spikes, "z": line_z,
-    }
+def ensure_series(key):
+    if key not in series:
+        (line,) = ax.plot([], [], marker="o", linewidth=1.8, alpha=0.9, label=key)
+        series[key] = {"x": [], "y": [], "line": line, "buf": deque(maxlen=WINDOW)}
+        ax.legend(loc="upper left", fontsize=8)
 
-def rebuild_legend():
-    global legend_map
-    leg = ax_top.legend(loc="lower right", fancybox=True, framealpha=0.5)
-    legend_map = {}
-    for lh in leg.legendHandles:
-        label = lh.get_label()
-        if label in series:
-            lh.set_picker(True); lh.set_pickradius(6)
-            legend_map[lh] = label
-    fig.canvas.draw_idle()
+# === Update function ===
+def update(frame):
+    polled = consumer.poll(timeout_ms=100, max_records=50)
+    updated = False
 
-def stats(buf):
-    arr = np.asarray(buf, dtype=float)
-    return float(arr.mean()), float(arr.std(ddof=0))
-
-def is_spike(value, mean, std, have_window):
-    if not have_window: return False
-    if std == 0: return abs(value - mean) >= MIN_DELTA
-    z = abs((value - mean) / std)
-    return z >= SIGMAS and abs(value - mean) >= MIN_DELTA
-
-last_snap = 0.0
-def snapshot_files():
-    if not SNAP_PATH: return []
-    os.makedirs(os.path.dirname(SNAP_PATH), exist_ok=True)
-    files = []
-    fig.savefig(SNAP_PATH, dpi=150, bbox_inches="tight"); files.append(SNAP_PATH)
-    if ARCHIVE_DIR:
-        os.makedirs(ARCHIVE_DIR, exist_ok=True)
-        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        archive_path = os.path.join(ARCHIVE_DIR, f"visual_{ts}.png")
-        fig.savefig(archive_path, dpi=150, bbox_inches="tight"); files.append(archive_path)
-    return files
-
-def maybe_snapshot():
-    global last_snap
-    if SNAP_EVERY <= 0: return
-    now = time.time()
-    if now - last_snap >= SNAP_EVERY:
-        snapshot_files()
-        last_snap = now
-
-def update(_frame):
-    polled = consumer.poll(timeout_ms=100)
-    created = False; got_any = False
-    for _tp, records in polled.items():
+    for tp, records in polled.items():
         for rec in records:
             v = rec.value
-            state, cond = v.get("state",""), v.get("condition","")
-            if not allowed(state, cond): continue
-            k = key_of(state, cond)
-            if k not in series:
-                create_series(k); created = True
-            s = series[k]
-            val = float(v["prevalence"])
-            s["xs"].append(len(s["xs"]))
-            s["ys"].append(val)
-            s["roll"].append(val)
-            mean, std = stats(s["roll"])
-            s["means"].append(mean)
-            z = 0.0 if std == 0 else (val - mean) / std
-            s["zs"].append(z)
-            if is_spike(val, mean, std, len(s["roll"]) >= WINDOW):
-                s["spike_x"].append(s["xs"][-1]); s["spike_y"].append(val)
-                if spike_writer:
-                    spike_writer.writerow([
-                        s["xs"][-1], v.get("timestamp",""), state, cond, val,
-                        mean, std, z, WINDOW, SIGMAS, MIN_DELTA
-                    ])
-                    spike_fp.flush()
-            s["raw"].set_data(s["xs"], s["ys"])
-            s["mean"].set_data(s["xs"], s["means"])
-            s["z"].set_data(s["xs"], s["zs"])
-            offs = np.column_stack([s["spike_x"], s["spike_y"]]) if s["spike_x"] else np.empty((0,2))
-            s["spike"].set_offsets(offs)
-            got_any = True
-    if created: rebuild_legend()
-    if got_any:
-        ax_top.relim(); ax_top.autoscale_view()
-        ax_bot.relim(); ax_bot.autoscale_view(scaley=True)
-        maybe_snapshot()
-    artists = []
-    for s in series.values():
-        artists.extend([s["raw"], s["mean"], s["spike"], s["z"]])
-    return artists
+            try:
+                p = float(v["prevalence"])
+                key = f"{v.get('state','?')}|{v.get('condition','?')}"
+                ensure_series(key)
 
-def on_pick(event):
-    h = event.artist; key = legend_map.get(h)
-    if not key: return
-    s = series[key]; vis = not s["raw"].get_visible()
-    s["raw"].set_visible(vis); s["mean"].set_visible(vis); s["spike"].set_visible(vis); s["z"].set_visible(vis)
-    fig.canvas.draw_idle()
+                entry = series[key]
+                entry["x"].append(len(entry["x"]))
+                entry["y"].append(p)
+                entry["buf"].append(p)
+                entry["line"].set_data(entry["x"], entry["y"])
 
-def on_key(event):
-    if event.key and event.key.lower() == "q":
-        _close()
+                # rolling avg + z-score
+                avg = sum(entry["buf"]) / len(entry["buf"])
+                zs = zscore(entry["buf"])
 
-def _close(*_):
-    try: snapshot_files()
-    except Exception: pass
-    plt.close("all")
-    try: consumer.close()
-    except Exception: pass
-    try:
-        if spike_fp: spike_fp.close()
-    except Exception: pass
-    sys.exit(0)
+                # print debug
+                print(f"{v.get('timestamp','?')} {key}={p:.3f} | "
+                      f"rolling_avg({len(entry['buf'])})={avg:.3f} z={zs:.2f}")
 
-fig.canvas.mpl_connect("pick_event", on_pick)
+                # plot z-score (just latest point)
+                ax_z.plot([entry["x"][-1]], [zs], marker="o", alpha=0.7)
+                updated = True
+            except Exception as e:
+                print("[visual] skipped record:", v, "err:", e)
+
+    if updated:
+        max_x = max((len(s["x"]) for s in series.values()), default=1)
+        ax.set_xlim(0, max(10, max_x))
+        ax_z.set_xlim(0, max(10, max_x))
+
+    return [entry["line"] for entry in series.values()]
+
+# === Quit with Q ===
+def on_key(e):
+    if e.key and e.key.lower() == "q":
+        plt.close(fig)
+
 fig.canvas.mpl_connect("key_press_event", on_key)
-signal.signal(signal.SIGINT, _close)
-signal.signal(signal.SIGTERM, _close)
 
-ani = FuncAnimation(fig, update, interval=300, blit=True)
-plt.tight_layout()
+ani = FuncAnimation(fig, update, interval=300, blit=True, cache_frame_data=False)
+
+print(f"[visual] Listening on topic={TOPIC}, bootstrap={BOOTSTRAP}, group={GROUP_ID}")
+print("[visual] Press Q in the chart window to quit.")
+
 plt.show()
+
+consumer.close()
