@@ -4,3 +4,4 @@ matplotlib==3.9.0
 kafka-python==2.0.2   # simple, pure-Python Kafka client
 pydantic==2.8.2       # easy validation (optional but nice)
 python-dateutil==2.9.0.post0
+matplotlib
