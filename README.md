@@ -22,3 +22,7 @@ Install dependencies:
 pip install -r requirements.txt
 Copy environment file and update values if needed:
 cp .env.example .env
+## Live Rolling Average Visualization
+This animated line updates as each message arrives, showing the latest prevalence and a rolling mean (window=5) to smooth short-term noise.
+
+![Rolling average](images/rolling_avg.png)
